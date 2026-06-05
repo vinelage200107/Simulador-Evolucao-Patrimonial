@@ -78,21 +78,24 @@ def projetar_resgate(P_start, resgate_mensal, taxa_juros_aa, reajuste_resgate_aa
     r_m = (1 + taxa_juros_aa) ** (1 / 12) - 1
     M = int(round(anos * 12))
     anos_acum = meses_offset / 12
-    S = [P_start]
-    resg = [0.0]
-    for k in range(1, M + 1):
-        j = k // 12  # ano (0-based) dentro da fase de resgate
+    # resgate planejado por mes (m=1..M); reajuste a cada 12 meses (mes 13, 25, ...)
+    R = [0.0]
+    for m in range(1, M + 1):
+        j = (m - 1) // 12  # ano (0-based) dentro da fase de resgate
         if modo_real:
-            # valor de hoje inflacionado ate o ano do resgate, com crescimento real opcional
-            r_k = resgate_mensal * (1 + inflacao_aa) ** (anos_acum + j) * (1 + reajuste_resgate_aa) ** j
+            R.append(resgate_mensal * (1 + inflacao_aa) ** (anos_acum + j)
+                     * (1 + reajuste_resgate_aa) ** j)
         else:
-            r_k = resgate_mensal * (1 + reajuste_resgate_aa) ** j
-        # nao retira mais do que existe (mantem coerencia do total resgatado)
-        r_efetivo = min(r_k, S[k - 1])
-        S.append(max((S[k - 1] - r_k) * (1 + r_m), 0.0))
-        resg.append(r_efetivo)
-    nominal = S
-    real = [S[k] / (1 + inflacao_aa) ** ((meses_offset + k) / 12) for k in range(M + 1)]
+            R.append(resgate_mensal * (1 + reajuste_resgate_aa) ** j)
+    V = [P_start, P_start]   # 1o mes parado (igual a planilha/relatorio de resgates)
+    resg = [0.0, 0.0]        # nada retirado no 1o mes
+    for m in range(2, M + 1):
+        saldo = V[m - 1]
+        retira = min(saldo, R[m])   # nao retira mais do que existe
+        resg.append(retira)
+        V.append(max((saldo - R[m]) * (1 + r_m), 0.0))
+    nominal = [V[m] for m in range(M + 1)]
+    real = [V[m] / (1 + inflacao_aa) ** ((meses_offset + m) / 12) for m in range(M + 1)]
     return nominal, real, resg
 
 
@@ -102,6 +105,24 @@ def mes_esgotamento(res_nominal):
         if res_nominal[k] <= 0:
             return k
     return None
+
+
+def duracao_carteira(P_start, resgate_mensal, taxa_juros_aa, reajuste_resgate_aa,
+                     inflacao_aa, anos_resg, meses_offset, modo_real,
+                     horizonte_stress=40):
+    """Estima por quanto tempo a carteira dura na fase de resgate.
+    Projeta ate H = max(40, prazo cadastrado) anos para testar sustentabilidade.
+    Retorna (texto, esgota_bool, meses)."""
+    H = max(horizonte_stress, anos_resg)
+    rn, _, _ = projetar_resgate(P_start, resgate_mensal, taxa_juros_aa,
+                                reajuste_resgate_aa, inflacao_aa, H, meses_offset, modo_real)
+    esg = mes_esgotamento(rn)
+    if esg is None:
+        return f"Não esgota em {H} anos (resgate sustentável)", False, None
+    anos = esg / 12
+    texto = f"{anos:.1f} anos  ({esg} meses)".replace(".", ",")
+    return texto, True, esg
+
 
 
 # --------------------------- GRAFICO ---------------------------
@@ -395,9 +416,29 @@ def gerar_pdf_bytes(nome_cliente, P0, aporte_mensal, crescimento_aporte_aa,
     twr, thr = tr.wrapOn(c, W, H)
     tr.drawOn(c, x_res, y_tab - thr)
 
-    # nota de esgotamento
-    esg = mes_esgotamento(res_nom)
-    y_nota = y_tab - max(thp, thr) - 8
+    # --- caixa "Duracao estimada da carteira" (abaixo de Resultados, lado direito) ---
+    txt_dur, esgota, meses_dur = duracao_carteira(
+        P_start, resgate_mensal, taxa_juros_aa, reajuste_resgate_aa,
+        inflacao_aa, anos_resg, M_acum, modo_real)
+    box_w, box_h = 360, 42
+    box_x = x_res
+    box_top = y_tab - thr - 14
+    c.setFillColor(colors.HexColor("#EAF1F8"))
+    c.setStrokeColor(AZUL_ESCURO)
+    c.setLineWidth(1.0)
+    c.roundRect(box_x, box_top - box_h, box_w, box_h, 6, stroke=1, fill=1)
+    c.setFillColor(AZUL_ESCURO)
+    c.setFont("Helvetica-Bold", 10.5)
+    c.drawCentredString(box_x + box_w / 2, box_top - 15, "Duração estimada da carteira")
+    c.setFillColor(colors.HexColor("#B05A1F"))
+    c.setFont("Helvetica-Bold", 11.5)
+    c.drawCentredString(box_x + box_w / 2, box_top - 31, txt_dur)
+    c.setFillColor(colors.black)
+
+    # conteudo abaixo comeca no mais baixo entre as duas colunas (esq: params, dir: box)
+    bottom_esq = y_tab - thp
+    bottom_dir = box_top - box_h
+    y_nota = min(bottom_esq, bottom_dir) - 12
 
     # no modo real, traduz a renda de hoje para o nominal no inicio e fim do resgate
     if modo_real:
@@ -406,23 +447,12 @@ def gerar_pdf_bytes(nome_cliente, P0, aporte_mensal, crescimento_aporte_aa,
             * (1 + reajuste_resgate_aa) ** (anos_resg - 1)
         c.setFillColor(AZUL_ESCURO)
         c.setFont("Helvetica-Oblique", 8.5)
-        c.drawString(margem, y_nota,
-                     f"Renda nominal pretendida: {brl(nom_ini, 0)}/mes no 1o ano e "
-                     f"{brl(nom_fim, 0)}/mes no ultimo, mantendo o poder de compra de "
-                     f"{brl(resgate_mensal, 0)} de hoje.")
+        c.drawCentredString(W / 2, y_nota,
+                            f"Renda nominal pretendida: {brl(nom_ini, 0)}/mes no 1o ano e "
+                            f"{brl(nom_fim, 0)}/mes no ultimo, mantendo o poder de compra de "
+                            f"{brl(resgate_mensal, 0)} de hoje.")
         c.setFillColor(colors.black)
-        y_nota -= 12
-
-    if esg is not None:
-        ano_e = (esg - 1) // 12 + 1
-        mes_e = MESES_PT[(esg - 1) % 12]
-        c.setFillColor(colors.HexColor(VERMELHO))
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(margem, y_nota,
-                     f"Atenção: patrimônio se esgota em {mes_e} do ano {ano_e} de resgate.")
-        c.setFillColor(colors.black)
-
-    # --- grafico (largura total, embaixo) ---
+        y_nota -= 10
     fig = gerar_grafico(anos_acum, anos_resg, acc_nom, acc_real, res_nom, res_real)
     buf_img = io.BytesIO()
     fig.savefig(buf_img, format="png", bbox_inches="tight", facecolor="white")
@@ -528,11 +558,11 @@ if modo_real:
         f"{brl(resgate, 0)} de hoje."
     )
 
-esg = mes_esgotamento(res_nom)
-if esg is not None:
-    ano_e = (esg - 1) // 12 + 1
-    mes_e = MESES_PT[(esg - 1) % 12]
-    st.warning(f"Patrimonio se esgota em {mes_e} do ano {ano_e} de resgate.")
+txt_dur, esgota, meses_dur = duracao_carteira(P_start, resgate, juros, reaj, inflacao, anos_resg, M_acum, modo_real)
+if esgota:
+    st.error(f"Duracao estimada da carteira: {txt_dur}")
+else:
+    st.success(f"Duracao estimada da carteira: {txt_dur}")
 
 st.pyplot(gerar_grafico(anos_acum, anos_resg, acc_nom, acc_real, res_nom, res_real))
 
