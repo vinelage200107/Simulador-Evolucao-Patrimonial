@@ -63,18 +63,30 @@ def projetar_acumulacao(P0, aporte_mensal, taxa_juros_aa, crescimento_aporte_aa,
 
 
 def projetar_resgate(P_start, resgate_mensal, taxa_juros_aa, reajuste_resgate_aa,
-                     inflacao_aa, anos, meses_offset):
+                     inflacao_aa, anos, meses_offset, modo_real=True):
     """Fase de resgate. Retira no inicio do mes e o que sobra rende.
     Piso em zero (nunca negativo). Reajuste anual do resgate.
     'meses_offset' = meses ja decorridos na acumulacao, usado para deflacionar
     o patrimonio real de forma continua desde o inicio.
-    Indice 0 = ponto de virada (= patrimonio final da acumulacao)."""
+    Indice 0 = ponto de virada (= patrimonio final da acumulacao).
+
+    modo_real=True: 'resgate_mensal' esta em valores de hoje. O programa infla
+      esse valor ate o ano do resgate (mantem poder de compra). Nesse modo,
+      'reajuste_resgate_aa' representa crescimento REAL anual da renda (0 = constante).
+    modo_real=False: 'resgate_mensal' e um valor nominal fixo, reajustado por
+      'reajuste_resgate_aa' ao ano (comportamento nominal puro)."""
     r_m = (1 + taxa_juros_aa) ** (1 / 12) - 1
     M = int(round(anos * 12))
+    anos_acum = meses_offset / 12
     S = [P_start]
     resg = [0.0]
     for k in range(1, M + 1):
-        r_k = resgate_mensal * (1 + reajuste_resgate_aa) ** (k // 12)
+        j = k // 12  # ano (0-based) dentro da fase de resgate
+        if modo_real:
+            # valor de hoje inflacionado ate o ano do resgate, com crescimento real opcional
+            r_k = resgate_mensal * (1 + inflacao_aa) ** (anos_acum + j) * (1 + reajuste_resgate_aa) ** j
+        else:
+            r_k = resgate_mensal * (1 + reajuste_resgate_aa) ** j
         # nao retira mais do que existe (mantem coerencia do total resgatado)
         r_efetivo = min(r_k, S[k - 1])
         S.append(max((S[k - 1] - r_k) * (1 + r_m), 0.0))
@@ -272,7 +284,7 @@ def desenhar_paginas_mensais(c, W, H, nome_cliente, titulo_fase, linhas, cabecal
 # --------------------------- PDF -------------------------------
 def gerar_pdf_bytes(nome_cliente, P0, aporte_mensal, crescimento_aporte_aa,
                     anos_acum, resgate_mensal, reajuste_resgate_aa, anos_resg,
-                    taxa_juros_aa, inflacao_aa):
+                    taxa_juros_aa, inflacao_aa, modo_real=True):
     M_acum = int(round(anos_acum * 12))
     acc_nom, acc_real, acc_inv, acc_aporte = projetar_acumulacao(
         P0, aporte_mensal, taxa_juros_aa, crescimento_aporte_aa, inflacao_aa, anos_acum)
@@ -280,7 +292,7 @@ def gerar_pdf_bytes(nome_cliente, P0, aporte_mensal, crescimento_aporte_aa,
 
     res_nom, res_real, res_resg = projetar_resgate(
         P_start, resgate_mensal, taxa_juros_aa, reajuste_resgate_aa,
-        inflacao_aa, anos_resg, M_acum)
+        inflacao_aa, anos_resg, M_acum, modo_real)
 
     buf_pdf = io.BytesIO()
     W, H = landscape(A4)
@@ -291,6 +303,12 @@ def gerar_pdf_bytes(nome_cliente, P0, aporte_mensal, crescimento_aporte_aa,
 
     # --- tabela de parametros (esquerda) ---
     sep = lambda txt: [txt, ""]
+    if modo_real:
+        label_resgate = "Renda mensal (valores de hoje)"
+        label_reajuste = "Crescimento real anual da renda"
+    else:
+        label_resgate = "Resgate mensal (nominal)"
+        label_reajuste = "Reajuste nominal anual dos resgates"
     dados_param = [
         ["Descrição", "Valor"],
         ["ACUMULAÇÃO", ""],
@@ -299,8 +317,8 @@ def gerar_pdf_bytes(nome_cliente, P0, aporte_mensal, crescimento_aporte_aa,
         ["Crescimento anual dos aportes", pct(crescimento_aporte_aa)],
         ["Anos de acumulação", str(anos_acum)],
         ["RESGATE", ""],
-        ["Resgate mensal", brl(resgate_mensal, 0)],
-        ["Reajuste anual dos resgates", pct(reajuste_resgate_aa)],
+        [label_resgate, brl(resgate_mensal, 0)],
+        [label_reajuste, pct(reajuste_resgate_aa)],
         ["Anos de resgate", str(anos_resg)],
         ["GERAIS", ""],
         ["Taxa de juros anual", pct(taxa_juros_aa)],
@@ -380,12 +398,27 @@ def gerar_pdf_bytes(nome_cliente, P0, aporte_mensal, crescimento_aporte_aa,
     # nota de esgotamento
     esg = mes_esgotamento(res_nom)
     y_nota = y_tab - max(thp, thr) - 8
+
+    # no modo real, traduz a renda de hoje para o nominal no inicio e fim do resgate
+    if modo_real:
+        nom_ini = resgate_mensal * (1 + inflacao_aa) ** anos_acum
+        nom_fim = resgate_mensal * (1 + inflacao_aa) ** (anos_acum + anos_resg - 1) \
+            * (1 + reajuste_resgate_aa) ** (anos_resg - 1)
+        c.setFillColor(AZUL_ESCURO)
+        c.setFont("Helvetica-Oblique", 8.5)
+        c.drawString(margem, y_nota,
+                     f"Renda nominal pretendida: {brl(nom_ini, 0)}/mes no 1o ano e "
+                     f"{brl(nom_fim, 0)}/mes no ultimo, mantendo o poder de compra de "
+                     f"{brl(resgate_mensal, 0)} de hoje.")
+        c.setFillColor(colors.black)
+        y_nota -= 12
+
     if esg is not None:
         ano_e = (esg - 1) // 12 + 1
         mes_e = MESES_PT[(esg - 1) % 12]
         c.setFillColor(colors.HexColor(VERMELHO))
         c.setFont("Helvetica-Bold", 9)
-        c.drawString(x_res, y_nota,
+        c.drawString(margem, y_nota,
                      f"Atenção: patrimônio se esgota em {mes_e} do ano {ano_e} de resgate.")
         c.setFillColor(colors.black)
 
@@ -442,8 +475,22 @@ with st.sidebar:
     anos_acum = st.number_input("Anos de acumulacao", min_value=1, max_value=70, value=None, step=1, placeholder="0")
 
     st.header("Resgate")
-    resgate = st.number_input("Resgate mensal (R$)", min_value=0.0, value=None, step=100.0, placeholder="0")
-    reaj_in = st.number_input("Reajuste anual dos resgates (%)", value=0.0, step=0.5)
+    modo_opcao = st.radio(
+        "Definir o resgate em",
+        ["Valores de hoje (real)", "Valor nominal"],
+        help="Valores de hoje: voce digita a renda no poder de compra de hoje e o "
+             "programa infla ate o ano do resgate. Valor nominal: valor fixo lancado "
+             "diretamente no futuro.",
+    )
+    modo_real = modo_opcao.startswith("Valores de hoje")
+    if modo_real:
+        label_resgate = "Renda mensal desejada hoje (R$)"
+        label_reaj = "Crescimento real anual da renda (%)"
+    else:
+        label_resgate = "Resgate mensal nominal (R$)"
+        label_reaj = "Reajuste nominal anual (%)"
+    resgate = st.number_input(label_resgate, min_value=0.0, value=None, step=100.0, placeholder="0")
+    reaj_in = st.number_input(label_reaj, value=0.0, step=0.5)
     anos_resg = st.number_input("Anos de resgate", min_value=1, max_value=70, value=None, step=1, placeholder="0")
 
     st.header("Gerais")
@@ -465,12 +512,21 @@ anos_resg = int(anos_resg)
 M_acum = anos_acum * 12
 acc_nom, acc_real, acc_inv, acc_aporte = projetar_acumulacao(P0, aporte, juros, cresc, inflacao, anos_acum)
 P_start = acc_nom[M_acum]
-res_nom, res_real, res_resg = projetar_resgate(P_start, resgate, juros, reaj, inflacao, anos_resg, M_acum)
+res_nom, res_real, res_resg = projetar_resgate(P_start, resgate, juros, reaj, inflacao, anos_resg, M_acum, modo_real)
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Patrimonio na aposentadoria", brl(acc_nom[M_acum]))
 col2.metric("Patrimonio ao fim dos resgates", brl(res_nom[-1]))
 col3.metric("Patrimonio real ao fim", brl(res_real[-1]))
+
+if modo_real:
+    nom_ini = resgate * (1 + inflacao) ** anos_acum
+    nom_fim = resgate * (1 + inflacao) ** (anos_acum + anos_resg - 1) * (1 + reaj) ** (anos_resg - 1)
+    st.caption(
+        f"Renda nominal pretendida: {brl(nom_ini, 0)}/mes no 1o ano de resgate e "
+        f"{brl(nom_fim, 0)}/mes no ultimo ano, mantendo o poder de compra de "
+        f"{brl(resgate, 0)} de hoje."
+    )
 
 esg = mes_esgotamento(res_nom)
 if esg is not None:
@@ -481,7 +537,7 @@ if esg is not None:
 st.pyplot(gerar_grafico(anos_acum, anos_resg, acc_nom, acc_real, res_nom, res_real))
 
 nome_pdf = nome.strip() if nome.strip() else "Cliente"
-pdf_bytes = gerar_pdf_bytes(nome_pdf, P0, aporte, cresc, anos_acum, resgate, reaj, anos_resg, juros, inflacao)
+pdf_bytes = gerar_pdf_bytes(nome_pdf, P0, aporte, cresc, anos_acum, resgate, reaj, anos_resg, juros, inflacao, modo_real)
 st.download_button(
     "Baixar relatorio em PDF",
     data=pdf_bytes,
